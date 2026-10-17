@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Construction and integration configuration for KVCR."""
 
+import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Protocol
@@ -42,12 +43,28 @@ class LocalDramOptions(msgspec.Struct, frozen=True):
     backend: str = "UCX"
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    return value in ("1", "true", "yes", "on") if value else default
+
+
 # Early pinning optimization was considered, but its complexity outweighed the benefit.
 class RemoteFWDramOptions(msgspec.Struct, frozen=True):
     eager_ctrl_connect: bool = True
     opportunistic_query: bool = False
     metadata_retry_interval_ms: int = 100
     backend: str = "UCX"
+    # Answer a peer's start_write with the keys READY in local DRAM and report the
+    # rest missing, instead of holding the batch for a framework pin. Pins are
+    # still tried when local DRAM holds none of the batch.
+    partial_local_source: bool = msgspec.field(
+        default_factory=lambda: _env_flag("KVCR_PARTIAL_LOCAL_SOURCE", False)
+    )
+    # Pin framework memory for keys local DRAM cannot serve. Off never waits on
+    # the engine: the peer gets what local DRAM holds, possibly nothing.
+    framework_pin_source: bool = msgspec.field(
+        default_factory=lambda: _env_flag("KVCR_FRAMEWORK_PIN_SOURCE", True)
+    )
 
 
 class G3Options(msgspec.Struct, frozen=True, kw_only=True):

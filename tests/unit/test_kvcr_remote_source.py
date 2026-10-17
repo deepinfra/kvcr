@@ -30,7 +30,7 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
-from kvcr.config import KVCRConfig, LocalDramOptions
+from kvcr.config import KVCRConfig, LocalDramOptions, RemoteFWDramOptions
 from kvcr.core import _BlockRecord, _KVCRCore
 from kvcr.progress import _STOP, _TransferRef
 from kvcr.remote_fw_dram import (
@@ -222,6 +222,140 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
         assert make_ref.call_count == 2
         assert agent.xfers[-1][1] == agent.xfers[-2][1]
         assert pinning.searches == []
+    finally:
+        agent.state = "DONE"
+        source.close()
+
+
+@pytest.mark.parametrize(
+    ("partial", "pin"), [(False, True), (True, True), (False, False)]
+)
+def test_partial_local_source_serves_resident_keys_without_waiting_for_pins(
+    partial, pin
+):
+    memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
+    agent, pinning, control = (
+        FakeNixlAgent(),
+        PendingPrimaryPinning(),
+        FakeBytesControl(),
+    )
+    source = _new_kvcr(
+        agent,
+        pinning,
+        control,
+        KVCRConfig(nixl_agent_name="source", pool_layouts=[("", 16)]),
+        name="source",
+        framework_regions=[
+            RegionDescriptor(addr=ctypes.addressof(memory), size=16, count=2)
+        ],
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+        remote_options=RemoteFWDramOptions(
+            partial_local_source=partial, framework_pin_source=pin
+        ),
+    )
+    resident, missing = BlockKey(b"resident"), BlockKey(b"missing")
+    try:
+        agent.state = "DONE"
+        deposit = source.deposit(
+            {resident: [_mem_descriptor(0, end_point_name="source")]}
+        )
+        assert _poll_until(source, bool) == [(deposit, _op_entries({resident: True}))]
+        request = msgspec.msgpack.decode(_start_write_message(21, resident))
+        request.update(
+            keys=[resident, missing],
+            dst_descriptors=[
+                [_TransferRef("target", 0, "")],
+                [_TransferRef("target", 1, "")],
+            ],
+        )
+        control.incoming.append(msgspec.msgpack.encode(request))
+        if partial or not pin:
+            # The resident key is written at once; the missing one is never pinned.
+            # (xfers[0] is the deposit; the peer write carries write_done.)
+            _wait_until(lambda: len(agent.xfers) == 2)
+            assert pinning.searches == []
+            assert not source._core._remote_fw_dram._source_pin_ops
+            done = _decode_notif(agent.xfers[-1][5])
+            assert done["success"] and done["completed_indices"] == [0]
+            residency = source._core._block_record_map[resident].local_dram
+            assert _poll_until(source, lambda _: residency.claim_count == 0) == []
+            assert not source._core._local_dram_sources_by_op
+            assert not _has_outstanding_operations(source)
+        else:
+            # The whole batch waits on a pin for the remainder.
+            _poll_until(source, lambda _: pinning.searches == [(missing,)])
+            assert len(agent.xfers) == 1
+    finally:
+        agent.state = "DONE"
+        source.close()
+
+
+@pytest.mark.parametrize("pin", [True, False])
+def test_source_all_miss_without_pins_answers_from_progress(pin):
+    memory = ctypes.create_string_buffer(32)
+    agent, pinning, control = (
+        FakeNixlAgent(),
+        PendingPrimaryPinning(),
+        FakeBytesControl(),
+    )
+    source = _new_kvcr(
+        agent,
+        pinning,
+        control,
+        KVCRConfig(nixl_agent_name="source", pool_layouts=[("", 16)]),
+        name="source",
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+        remote_options=RemoteFWDramOptions(
+            partial_local_source=True, framework_pin_source=pin
+        ),
+    )
+    missing = BlockKey(b"missing")
+    try:
+        agent.state = "DONE"
+        control.incoming.append(_start_write_message(41, missing))
+        if pin:
+            _poll_until(source, lambda _: pinning.searches == [(missing,)])
+            assert agent.xfers == [] and agent.sent_notifs == []
+        else:
+            # No caller poll: the progress thread tells the peer nothing was written.
+            _wait_until(lambda: agent.sent_notifs)
+            done = _decode_notif(agent.sent_notifs[-1][1])
+            assert done["success"] and done["completed_indices"] == []
+            assert agent.xfers == [] and pinning.searches == []
+            assert not source._core._remote_fw_dram._source_pin_ops
+            assert (
+                _poll_until(source, lambda _: not _has_outstanding_operations(source))
+                == []
+            )
+    finally:
+        agent.state = "DONE"
+        source.close()
+
+
+def test_source_without_local_dram_or_pins_answers_from_caller_poll():
+    agent, pinning, control = (
+        FakeNixlAgent(),
+        PendingPrimaryPinning(),
+        FakeBytesControl(),
+    )
+    source = _new_kvcr(
+        agent,
+        pinning,
+        control,
+        KVCRConfig(nixl_agent_name="source", pool_layouts=[("", 16)]),
+        name="source",
+        remote_options=RemoteFWDramOptions(framework_pin_source=False),
+    )
+    try:
+        agent.state = "DONE"
+        control.incoming.append(_start_write_message(31, BlockKey(b"missing")))
+        _poll_until(source, lambda _: agent.sent_notifs)
+        done = _decode_notif(agent.sent_notifs[-1][1])
+        assert done["success"] and done["completed_indices"] == []
+        assert agent.xfers == [] and pinning.searches == []
+        assert (
+            _poll_until(source, lambda _: not _has_outstanding_operations(source)) == []
+        )
     finally:
         agent.state = "DONE"
         source.close()

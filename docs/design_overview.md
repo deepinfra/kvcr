@@ -214,6 +214,8 @@ These statuses describe current KVCR knowledge, not a reservation or guarantee. 
 
 To serve from framework-owned memory, the KVCR acquires a pin asynchronously through `request_pin` and `poll_pin_results`, reusing covered keys and requesting only the remainder; the framework keeps it valid until `release_pin` accepts release. `release_pin` must be safely retryable: `False` or an exception leaves release pending; `True` means the framework accepts responsibility for completing release, including retaining uncertain allocations until the matching `quiesced` event.
 
+A pin resolves on the framework's schedule, so a peer write that needs one waits for it. Two `RemoteFWDramOptions` trade that wait for completeness. With `partial_local_source` (`KVCR_PARTIAL_LOCAL_SOURCE=1`), the source writes the keys READY in its DRAM at once and reports the rest missing, pinning only when its DRAM holds none of the batch. With `framework_pin_source` off (`KVCR_FRAMEWORK_PIN_SOURCE=0`), it never pins and answers from its DRAM alone, possibly with nothing. By default the source pins and waits.
+
 A deployment may choose to use only framework-owned memory. In that case, it uses the pinning mechanism together with `deliver` and does not use `deposit`, `fetch`, or `release`.
 
 **Completion and cancellation**

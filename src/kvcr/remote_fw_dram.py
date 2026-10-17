@@ -1214,32 +1214,65 @@ class _RemoteFWDram:
             # Use the caller queue on contention; add a progress-side
             # second attempt if contention makes this fallback too frequent.
             return False
+        options = self._options
+        # Without pins, waiting cannot find more, so a partial answer is the answer.
+        partial = options.partial_local_source or not options.framework_pin_source
+        present: list[int] = []
         selected = []
         try:
-            for key, layout in zip(source_pin.ordered_keys, layouts):
+            for index, (key, layout) in enumerate(
+                zip(source_pin.ordered_keys, layouts)
+            ):
                 record = kvcr._block_record_map.get(key)
                 residency = record.local_dram if record is not None else None
-                if residency is None or residency.state is not _LocalDramState.READY:
-                    return False
-                indices = _layout_indices(
-                    residency.layout,
-                    layout,
-                    allow_subset=source_pin.allow_layout_subset,
-                    indices_by_label=residency.indices_by_label,
+                indices = (
+                    None
+                    if residency is None or residency.state is not _LocalDramState.READY
+                    else _layout_indices(
+                        residency.layout,
+                        layout,
+                        allow_subset=source_pin.allow_layout_subset,
+                        indices_by_label=residency.indices_by_label,
+                    )
                 )
                 if indices is None:
-                    return False
+                    if not partial:
+                        return False
+                    continue
+                present.append(index)
                 selected.append(indices)
+            if not present and options.framework_pin_source:
+                # Nothing local: a framework pin is the only possible source.
+                return False
+            # Without pins this may write nothing, which still answers the peer.
+            source_keys = tuple(source_pin.ordered_keys[index] for index in present)
             sources = kvcr._claim_local_dram_sources(
-                source_pin.op_id, source_pin.ordered_keys, notify_capacity=False
+                source_pin.op_id, source_keys, notify_capacity=False
             )
             source_refs = tuple(
                 kvcr._local_dram.source_refs(sources[key], indices)
-                for key, indices in zip(source_pin.ordered_keys, selected)
+                for key, indices in zip(source_keys, selected)
             )
+            # The write depends on only the keys it reads.
+            source_pin.keys = set(source_keys)
             kvcr._add_block_dependencies(source_pin, new_operation=True)
         finally:
             kvcr._state_lock.release()
+        missing = len(source_pin.ordered_keys) - len(present)
+        if missing:
+            # Counted as a duration sample, so it reaches the framework's metrics.
+            self._record_progress_duration(
+                "source_partial_local",
+                source_pin.started_at,
+                "partial" if present else "miss",
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "KVCR_EVENT source_partial_local op=%d present=%d missing=%d",
+                    source_pin.op_handle,
+                    len(present),
+                    missing,
+                )
         # Claims keep the sources stable while the write is assembled unlocked.
         source_write = _SourceWriteOp(
             state=_SourceWriteState.READY_TO_WRITE,
@@ -1249,10 +1282,10 @@ class _RemoteFWDram:
             deadline=source_pin.deadline,
             remote_agent=source_pin.remote_agent,
             op_handle=source_pin.op_handle,
-            source_keys=source_pin.ordered_keys,
+            source_keys=source_keys,
             src_descriptors=source_refs,
-            dst_descriptors=source_pin.dst_descriptors,
-            completed_indices=tuple(range(len(source_pin.ordered_keys))),
+            dst_descriptors=tuple(source_pin.dst_descriptors[i] for i in present),
+            completed_indices=tuple(present),
             route=source_pin.route,
             _backend=self,
         )
@@ -1510,7 +1543,11 @@ class _RemoteFWDram:
         unresolved_keys = tuple(
             key for key in op.ordered_keys if key not in local_sources
         )
-        if unresolved_keys and not op.framework_acquire_attempted:
+        if (
+            unresolved_keys
+            and not op.framework_acquire_attempted
+            and self._options.framework_pin_source
+        ):
             if any(
                 not kvcr._framework_pin_keys[pin].isdisjoint(unresolved_keys)
                 for pin in self._releasing_framework_pins
